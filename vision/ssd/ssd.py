@@ -74,7 +74,6 @@ class SSD(nn.Module):
             header_index += 1
             confidences.append(confidence)
             locations.append(location)
-        t = time()
         for layer in self.base_net[end_layer_index:]:
             x = layer(x)
 
@@ -84,7 +83,6 @@ class SSD(nn.Module):
             header_index += 1
             confidences.append(confidence)
             locations.append(location)
-        print('forward time {} ms'.format((time()-t)*1000))
         confidences = torch.cat(confidences, 1)
         locations = torch.cat(locations, 1)
         

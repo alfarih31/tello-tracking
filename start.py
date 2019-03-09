@@ -24,7 +24,7 @@ set_point_x = w/2 #Image x's Center
 set_point_y = h/2-60 #Image y's Center
 lambda_x = 0.125*set_point_x #Target x tolerance
 lambda_y = 0.125*set_point_y
-set_point_dist = 150
+set_point_dist = 120
 lambda_d = 0.15*set_point_dist
 
 kw = 2375
@@ -37,7 +37,7 @@ with open('calibrateData.json') as jsonFile:
 cameraMat = array(cameraMat)
 distortCoef = array(distortCoef)
 
-label_path = 'models/voc-model-labels.txt'
+label_path = 'models/landing.txt'
 model_path = 'models/landing10000.pth'
 class_names = [name.strip() for name in open(label_path).readlines()]
 net = create_mobilenetv2_ssd_lite(len(class_names), is_test=True)
@@ -125,7 +125,7 @@ def program():
     y_flag = False
     dist_flag = False
     init_flag = False
-
+    buff2 = 'No Accomplished'
     while True:
         _frame = frame_read.frame
         frame = cv2.undistort(_frame, cameraMat, distortCoef)
@@ -141,15 +141,15 @@ def program():
             p1 = (int(bbox[0]), int(bbox[1]))
             p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
             cv2.rectangle(frame, p1, p2, (255, 0, 0), 2)
-            r1 = bbox[2]/bbox[3]
-            r2 = bbox[3]/bbox[2]
+            r1 = bbox[3]/bbox[2]
+            r2 = bbox[2]/bbox[3]
             dr1 = abs(r1-1.673)
             dr2 = abs(r2-0.597)
             if dr1 <= 0.3 or dr2 <= 0.2: break
         else: fail += 1
 
         if fail > 5:
-            tello.rotate_clockwise(15)
+            tello.rotate_clockwise(10)
             fail = 0
         cv2.imshow('TELLO', frame)
         cv2.waitKey(30)
@@ -175,12 +175,14 @@ def program():
                     if (err_x < lambda_x):
                         x_flag = True
                         pid_x.reset()
+                        buff2 = 'X Centered'
                     elif (err_x > lambda_x): mv_x = pid_x(center_x)
                     buff = 'Controlling center X %.2f, Current Center X %.2f'%(mv_x, center_x)
                 elif not y_flag:
                     if (err_y < lambda_y):
                         y_flag = True
                         pid_y.reset()
+                        buff2 = buff2 + '  Y Centered'
                     elif (err_y > lambda_y): mv_y = pid_y(center_y)
                     buff = 'Controlling center Y %.2f, Current Center Y%.2f'%(mv_y, center_y)
                 init_control(x_flag, y_flag, mv_x, mv_y)
@@ -191,16 +193,27 @@ def program():
                     if (err_dist < lambda_d):
                         dist_flag = True
                         pid_dist.reset()
-                    elif (err_dist > lambda_d): mv_dist = pid_dist(d2)
+                        buff2 = buff2 + '  Dist Approached'
+                    elif (err_dist > lambda_d):
+                        mv_dist = pid_dist(d2)
+                        maintain_dist(mv_dist)
+                        if err_x > lambda_x: x_flag = False, pid_dist.reset()
+                        elif err_y > lambda_y: y_flag = False, pid_dist.reset()
                     buff = 'Controlling Distance %.2f, Current Dist %.2f'%(mv_dist, d2)
-
             cv2.putText(frame, buff,
-                    (20, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,  # font scale
-                    (255, 0, 255),
-                    2)
-            cv2.imshow('TELLO', frame)
+                (20, 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,  # font scale
+                (200, 0, 255),
+                1)
+
+        cv2.putText(frame, buff2,
+                (20, int(h/2)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,  # font scale
+                (255, 255, 0),
+                2)
+        cv2.imshow('TELLO', frame)
         key = cv2.waitKey(33)
         if key == 27: break
 
