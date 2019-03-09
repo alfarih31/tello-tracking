@@ -9,6 +9,9 @@ from simple_pid import PID
 
 import argparse
 
+label_path = 'models/landing.txt'
+model_path = 'models/landing10000.pth'
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--tracking', type=str, default='ssd', help='Tracking algorithm to use: ssd or algo', required=True)
 opt = parser.parse_args()
@@ -37,8 +40,6 @@ with open('calibrateData.json') as jsonFile:
 cameraMat = array(cameraMat)
 distortCoef = array(distortCoef)
 
-label_path = 'models/landing.txt'
-model_path = 'models/landing10000.pth'
 class_names = [name.strip() for name in open(label_path).readlines()]
 net = create_mobilenetv2_ssd_lite(len(class_names), is_test=True)
 net.load(model_path)
@@ -126,6 +127,7 @@ def program():
     dist_flag = False
     init_flag = False
     buff2 = 'No Accomplished'
+    wait = 1 if opt.tracking == 'ssd' else 200
     while True:
         _frame = frame_read.frame
         frame = cv2.undistort(_frame, cameraMat, distortCoef)
@@ -214,7 +216,7 @@ def program():
                 (255, 255, 0),
                 2)
         cv2.imshow('TELLO', frame)
-        key = cv2.waitKey(33)
+        key = cv2.waitKey(wait)
         if key == 27: break
 
 def main():
