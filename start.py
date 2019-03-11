@@ -114,20 +114,15 @@ def init_control(x_flag, y_flag, outx, outy):
     if not x_flag: maintain_x(outx)
     elif not y_flag: maintain_y(outy)
 
-def program():
-    pid_x = PID(0.022, 0.0005, 0.001, setpoint=set_point_x, output_limits=(-100, 100), sample_time=None)
-    pid_y = PID(0.01, 0.0000, 0.0005, setpoint=set_point_y, output_limits=(-100, 100), sample_time=None)
-    pid_dist = PID(0.007, 0.0001, 0.004, setpoint=set_point_dist, output_limits=(-100, 100), sample_time=None)
+def search_target():
     fail = 0
-    mv_y = 0
-    mv_x = 0
-    mv_dist = 0
-    x_flag = False
-    y_flag = False
-    dist_flag = False
-    init_flag = False
-    buff2 = 'No Accomplished'
-    wait = 1 if opt.tracking == 'ssd' else 200
+    rotate = 10
+    rotation = 0
+
+    up = 20
+    lifted = 0
+
+    forward = 20
     while True:
         _frame = frame_read.frame
         frame = cv2.undistort(_frame, cameraMat, distortCoef)
@@ -138,11 +133,11 @@ def program():
                     1,  # font scale
                     (255, 0, 0),
                     2)
-
         if ok:
-            p1 = (int(bbox[0]), int(bbox[1]))
-            p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
-            cv2.rectangle(frame, p1, p2, (255, 0, 0), 2)
+            cv2.rectangle(frame,
+                (int(bbox[0]), int(bbox[1])),
+                (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])),
+                (255, 0, 0), 2)
             r1 = bbox[3]/bbox[2]
             r2 = bbox[2]/bbox[3]
             dr1 = abs(r1-1.673)
@@ -151,26 +146,57 @@ def program():
         else: fail += 1
 
         if fail > 5:
-            tello.rotate_clockwise(10)
+            if rotation >= 360:
+                if lifted >= 100:
+                    tello.move_down(100)
+                    sleep(0.5)
+                    tello.move_forward(forward)
+                    lifted = 0
+                else:
+                    tello.move_up(up)
+                    lifted += up
+                    rotation = 0
+            else:
+                tello.rotate_clockwise(rotate)
+                rotation += rotate
             fail = 0
         cv2.imshow('TELLO', frame)
-        cv2.waitKey(30)
+        cv2.waitKey(1)
+    return (_frame, bbox)
+
+def program():
+    pid_x = PID(0.022, 0.0005, 0.001, setpoint=set_point_x, output_limits=(-100, 100), sample_time=None)
+    pid_y = PID(0.01, 0.0000, 0.0005, setpoint=set_point_y, output_limits=(-100, 100), sample_time=None)
+    pid_dist = PID(0.007, 0.0001, 0.004, setpoint=set_point_dist, output_limits=(-100, 100), sample_time=None)
+    mv_y = 0
+    mv_x = 0
+    mv_dist = 0
+    x_flag = False
+    y_flag = False
+    dist_flag = False
+    init_flag = False
+    buff2 = 'No Accomplished'
+    wait = 1 if opt.tracking == 'ssd' else 200
+
+    _frame, bbox = search_target()
+
     if opt.tracking == 'algo': tracker = Tracker(algo=opt.tracking, frame=_frame, bbox=bbox)
     else: tracker = Tracker(algo=opt.tracking)
     while True:
         frame = cv2.undistort(frame_read.frame, cameraMat, distortCoef)
         ok, bbox = tracker(frame)
         if ok:
-            p1 = (int(bbox[0]), int(bbox[1]))
-            p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
-            cv2.rectangle(frame, p1, p2, (0, 255, 0), 2)
+            cv2.rectangle(frame,
+                (int(bbox[0]), int(bbox[1])),
+                (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])),
+                (0, 255, 0), 2)
 
             center_x = (bbox[2]/2)+bbox[0]
             center_y = (bbox[3]/2)+bbox[1]
             err_x = abs(center_x-set_point_x)
             err_y = abs(center_y-set_point_y)
 
-            d1, d2 = get_distance(bbox[2], bbox[3])
+            _, d2 = get_distance(bbox[2], bbox[3])
             err_dist = abs(d2-set_point_dist)
             if not init_flag:
                 if not x_flag:
@@ -199,8 +225,11 @@ def program():
                     elif (err_dist > lambda_d):
                         mv_dist = pid_dist(d2)
                         maintain_dist(mv_dist)
-                        if err_x > lambda_x: x_flag = False, pid_dist.reset()
-                        elif err_y > lambda_y: y_flag = False, pid_dist.reset()
+                        if err_x > lambda_x or err_y > lambda_y:
+                            x_flag = False
+                            y_flag = False
+                            init_flag = False
+                            pid_dist.reset()
                     buff = 'Controlling Distance %.2f, Current Dist %.2f'%(mv_dist, d2)
             cv2.putText(frame, buff,
                 (20, 20),
