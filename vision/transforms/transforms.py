@@ -72,6 +72,13 @@ class ConvertFromInts(object):
         return image.astype(np.float32), boxes, labels
 
 
+class Normalize(object):
+    def __init__(self, mean, std):
+        self.normalize = transforms.Normalize(mean, std)
+
+    def __call__(self, image, boxes=None, labels=None):
+        return self.normalize(image), boxes, labels
+
 class SubtractMeans(object):
     def __init__(self, mean):
         self.mean = np.array(mean, dtype=np.float32)
@@ -80,7 +87,6 @@ class SubtractMeans(object):
         image = image.astype(np.float32)
         image -= self.mean
         return image.astype(np.float32), boxes, labels
-
 
 class ToAbsoluteCoords(object):
     def __call__(self, image, boxes=None, labels=None):
@@ -113,6 +119,15 @@ class Resize(object):
                                  self.size))
         return image, boxes, labels
 
+class ComputeHOG(object):
+    def __call__(self, image, boxes=None, labels=None):
+        x, y, c = np.shape(image)
+        gx = cv2.Sobel(image, cv2.CV_32F, 1, 0, ksize=1)
+        gy = cv2.Sobel(image, cv2.CV_32F, 0, 1, ksize=1)
+        mag, angle = cv2.cartToPolar(gx, gy, angleInDegrees=True)
+        hog_features = np.concatenate((gx, gy, mag, angle))
+        hog_features = np.reshape(hog_features, (x, y, c*4))
+        return hog_features, boxes, labels
 
 class RandomSaturation(object):
     def __init__(self, lower=0.5, upper=1.5):

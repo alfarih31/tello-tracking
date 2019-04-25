@@ -14,7 +14,7 @@ def SeperableConv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=
     ReLU = nn.ReLU if onnx_compatible else nn.ReLU6
     return Sequential(
         Conv2d(in_channels=in_channels, out_channels=in_channels, kernel_size=kernel_size,
-               groups=in_channels, stride=stride, padding=padding),
+               groups=in_channels, stride=stride, padding=padding) ,
         BatchNorm2d(in_channels),
         ReLU(),
         Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1),
@@ -23,7 +23,7 @@ def SeperableConv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=
 
 def create_mobilenetv2_ssd_lite(num_classes, width_mult=1.0, use_batch_norm=True, onnx_compatible=False, is_test=False):
     base_net = MobileNetV2(width_mult=width_mult, use_batch_norm=use_batch_norm,
-                           onnx_compatible=onnx_compatible).features
+                           onnx_compatible=onnx_compatible, inp=12).features
 
     source_layer_indexes = [
         GraphPath(14, 'conv', 3),

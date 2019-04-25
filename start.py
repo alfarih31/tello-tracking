@@ -1,20 +1,33 @@
 from djitellopy import Tello
+#import tellopy
 import cv2
 from time import sleep
-from json import load
-from numpy import array
+from json import load as jload
+from numpy import array, shape
+from torch import load, set_flush_denormal
 from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite, create_mobilenetv2_ssd_lite_predictor
+from vision.ssd.mobilenet_v2_ffssd import create_mobilenetv2_ffssd, create_mobilenetv2_ffssd_predictor
 from vision.utils.misc import Timer
 from simple_pid import PID
-
 import argparse
 
-label_path = 'models/landing.txt'
-model_path = 'models/landing10000.pth'
+set_flush_denormal(True)
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--tracking', type=str, default='ssd', help='Tracking algorithm to use: ssd or algo', required=True)
+parser.add_argument('--tracking', type=str, default='ssd',
+        help='Tracking algorithm to use: ssd or algo', required=True)
+parser.add_argument('--net', type=str, default='mb2-ffssd',
+        help='Network name', required=True)
+parser.add_argument('--model', type=str, default='models/FFSSD',
+        help='Pytorch model, foramt pt or pth', required=True)
+parser.add_argument('--label', type=str, default='models/person.txt',
+        help='Label for model', required=True)
+parser.add_argument('--out', type=str, default='out.mp4',
+        help='output video', required=True)
 opt = parser.parse_args()
+
+label_path = str(opt.label)
+model_path = str(opt.model)
 
 tello = Tello()
 tello.connect()
@@ -23,29 +36,45 @@ tello.streamon()
 sleep(2)
 frame_read = tello.get_frame_read()
 h, w = frame_read.frame.shape[:2]
+
+fourcc = cv2.VideoWriter_fourcc('M','J','P','G')
+writer = cv2.VideoWriter(opt.out, fourcc, 6.0, (w,h))
+
 set_point_x = w/2 #Image x's Center
 set_point_y = h/2-60 #Image y's Center
 lambda_x = 0.125*set_point_x #Target x tolerance
 lambda_y = 0.125*set_point_y
-set_point_dist = 120
+set_point_dist = 55
 lambda_d = 0.15*set_point_dist
+
+RECORD = False
 
 kw = 2375
 kh = 38950
 
 with open('calibrateData.json') as jsonFile:
-    data = load(jsonFile)
+    data = jload(jsonFile)
     cameraMat = data['cameraMat']
     distortCoef = data['distortionCoef']
 cameraMat = array(cameraMat)
 distortCoef = array(distortCoef)
 
 class_names = [name.strip() for name in open(label_path).readlines()]
-net = create_mobilenetv2_ssd_lite(len(class_names), is_test=True)
-net.load(model_path)
-predictor = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
+num_classes = len(class_names)
 
-
+if opt.net == 'mb2-ssd':
+    net = create_mobilenetv2_ssd_lite(
+        num_classes=num_classes,
+        is_test=True,
+    )
+    predictor = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
+elif opt.net == 'mb2-ffssd':
+    net = create_mobilenetv2_ffssd(
+        num_classes=num_classes,
+        is_test=True,
+    )
+    predictor = create_mobilenetv2_ffssd_predictor(net, candidate_size=200)
+net.load_state_dict(load(model_path, map_location=lambda storage, loc: storage))
 timer = Timer()
 
 def control(key, speed):
@@ -116,19 +145,20 @@ def init_control(x_flag, y_flag, outx, outy):
 
 def search_target():
     fail = 0
-    rotate = 10
+    rotate = 20
     rotation = 0
 
-    up = 20
+    up = 40
     lifted = 0
 
     forward = 20
+    RECORD = True
     while True:
         _frame = frame_read.frame
         frame = cv2.undistort(_frame, cameraMat, distortCoef)
         ok, bbox = detect(frame)
-        cv2.putText(frame, 'PROGRAM',
-                    (20, 20),
+        cv2.putText(frame, 'SEARCHING TARGET',
+                    (20, h-90),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,  # font scale
                     (255, 0, 0),
@@ -140,17 +170,20 @@ def search_target():
                 (255, 0, 0), 2)
             r1 = bbox[3]/bbox[2]
             r2 = bbox[2]/bbox[3]
+            print(r1, r2)
             dr1 = abs(r1-1.673)
             dr2 = abs(r2-0.597)
-            if dr1 <= 0.3 or dr2 <= 0.2: break
+            if r2 <= 0.5: break
+            else: fail += 1
         else: fail += 1
 
         if fail > 5:
             if rotation >= 360:
                 if lifted >= 100:
-                    tello.move_down(100)
-                    sleep(0.5)
-                    tello.move_forward(forward)
+                    tello.move_down(lifted)
+                    ok = tello.move_forward(forward)
+                    while not ok:
+                        ok = tello.move_forward(forward)
                     lifted = 0
                 else:
                     tello.move_up(up)
@@ -161,7 +194,8 @@ def search_target():
                 rotation += rotate
             fail = 0
         cv2.imshow('TELLO', frame)
-        cv2.waitKey(1)
+        writer.write(frame)
+        if cv2.waitKey(1) == 27: break
     return (_frame, bbox)
 
 def program():
@@ -175,6 +209,7 @@ def program():
     y_flag = False
     dist_flag = False
     init_flag = False
+    RECORD = True
     buff2 = 'No Accomplished'
     wait = 1 if opt.tracking == 'ssd' else 200
 
@@ -205,14 +240,14 @@ def program():
                         pid_x.reset()
                         buff2 = 'X Centered'
                     elif (err_x > lambda_x): mv_x = pid_x(center_x)
-                    buff = 'Controlling center X %.2f, Current Center X %.2f'%(mv_x, center_x)
+                    buff = 'Controlling center X %.2f, Center X %.2f'%(mv_x, center_x)
                 elif not y_flag:
                     if (err_y < lambda_y):
                         y_flag = True
                         pid_y.reset()
                         buff2 = buff2 + '  Y Centered'
                     elif (err_y > lambda_y): mv_y = pid_y(center_y)
-                    buff = 'Controlling center Y %.2f, Current Center Y%.2f'%(mv_y, center_y)
+                    buff = 'Controlling center Y %.2f, Center Y%.2f'%(mv_y, center_y)
                 init_control(x_flag, y_flag, mv_x, mv_y)
 
                 if x_flag and y_flag: init_flag = True
@@ -222,6 +257,7 @@ def program():
                         dist_flag = True
                         pid_dist.reset()
                         buff2 = buff2 + '  Dist Approached'
+                        tello.land()
                     elif (err_dist > lambda_d):
                         mv_dist = pid_dist(d2)
                         maintain_dist(mv_dist)
@@ -230,13 +266,13 @@ def program():
                             y_flag = False
                             init_flag = False
                             pid_dist.reset()
-                    buff = 'Controlling Distance %.2f, Current Dist %.2f'%(mv_dist, d2)
+                    buff = 'Controlling Distance %.2f, Dist %.2f'%(mv_dist, d2)
             cv2.putText(frame, buff,
                 (20, 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,  # font scale
-                (200, 0, 255),
-                1)
+                (127, 127, 255),
+                2)
 
         cv2.putText(frame, buff2,
                 (20, int(h/2)),
@@ -244,9 +280,19 @@ def program():
                 1,  # font scale
                 (255, 255, 0),
                 2)
+        cv2.putText(frame, 'TRACKING',
+                (20, int(h-90)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,  # font scale
+                (255, 0, 0),
+                2)
         cv2.imshow('TELLO', frame)
+        writer.write(frame)
         key = cv2.waitKey(wait)
         if key == 27: break
+        elif key == ord('e') and RECORD:
+            writer.release()
+            RECORD = False
 
 def main():
     count = 0
@@ -263,11 +309,17 @@ def main():
             print(b)
             count = 0
 
-        if key == 27: break
+        if key == 27:
+            if RECORD:
+                writer.release()
+            break
         elif key == ord('p'): program()
+        elif key == ord('e') and RECORD:
+            writer.release()
 
 if __name__ == '__main__':
     main()
     tello.land()
     sleep(1)
     tello.end()
+    writer.release()
