@@ -1,325 +1,365 @@
-from djitellopy import Tello
-#import tellopy
+"""
+tellotracker:
+Allows manual operation of the drone and demo tracking mode.
+
+Requires mplayer to record/save video.
+
+Controls:
+- tab to lift off
+- WASD to move the drone
+- space/shift to ascend/descent slowly
+- Q/E to yaw slowly
+- arrow keys to ascend, descend, or yaw quickly
+- backspace to land, or P to palm-land
+- enter to take a picture
+- R to start recording video, R again to stop recording
+  (video and photos will be saved to a timestamped file in ~/Pictures/)
+- Z to toggle camera zoom state
+  (zoomed-in widescreen or high FOV 4:3)
+- T to toggle tracking
+@author Leonie Buckley, Saksham Sinha and Jonathan Byrne
+@copyright 2018 see license file for details
+"""
+import time
+import datetime
+import os
+import tellopy
+import numpy
+import av
 import cv2
-from time import sleep
-from json import load as jload
-from numpy import array, shape
+from yaml import load as yaml_load
 from torch import load, set_flush_denormal
+from simple_pid import PID
+
+from pynput import keyboard
+from utils import Flags
+from vision.ssd.predictor import Predictor
 from vision.ssd.mobilenet_v2_ssd_lite import create_mobilenetv2_ssd_lite, create_mobilenetv2_ssd_lite_predictor
 from vision.ssd.mobilenet_v2_ffssd import create_mobilenetv2_ffssd, create_mobilenetv2_ffssd_predictor
-from vision.utils.misc import Timer
-from simple_pid import PID
-import argparse
+from tracker import Tracker
 
 set_flush_denormal(True)
+configs = yaml_load(open('configs.yaml', 'r'))
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--tracking', type=str, default='ssd',
-        help='Tracking algorithm to use: ssd or algo', required=True)
-parser.add_argument('--net', type=str, default='mb2-ffssd',
-        help='Network name', required=True)
-parser.add_argument('--model', type=str, default='models/FFSSD',
-        help='Pytorch model, foramt pt or pth', required=True)
-parser.add_argument('--label', type=str, default='models/person.txt',
-        help='Label for model', required=True)
-parser.add_argument('--out', type=str, default='out.mp4',
-        help='output video', required=True)
-opt = parser.parse_args()
+def init_predictor():
+    class_names = [name.strip() for name in open(configs['MODELS']['LABEL']).readlines()]
+    num_classes = len(class_names)
 
-label_path = str(opt.label)
-model_path = str(opt.model)
+    if configs['MODELS']['NAME'] == 'mb2-ssd':
+        net = create_mobilenetv2_ssd_lite(
+            num_classes=num_classes,
+            is_test=True,
+        )
+        predictor = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
+    elif configs['MODELS']['NAME'] == 'mb2-ffssd':
+        net = create_mobilenetv2_ffssd(
+            num_classes=num_classes,
+            is_test=True,
+        )
+        predictor = create_mobilenetv2_ffssd_predictor(net, candidate_size=200)
+    else: raise ValueError("Available model: \n 1. mb2-ffssd \n 2. mb2-ssd")
 
-tello = Tello()
-tello.connect()
-battery = tello.get_battery()
-tello.streamon()
-sleep(2)
-frame_read = tello.get_frame_read()
-h, w = frame_read.frame.shape[:2]
+    net.load_state_dict(load(configs['MODELS']['WEIGHT'], map_location=lambda storage, loc: storage))
 
-fourcc = cv2.VideoWriter_fourcc('M','J','P','G')
-writer = cv2.VideoWriter(opt.out, fourcc, 6.0, (w,h))
-
-set_point_x = w/2 #Image x's Center
-set_point_y = h/2-60 #Image y's Center
-lambda_x = 0.125*set_point_x #Target x tolerance
-lambda_y = 0.125*set_point_y
-set_point_dist = 55
-lambda_d = 0.15*set_point_dist
-
-RECORD = False
-
-kw = 2375
-kh = 38950
-
-with open('calibrateData.json') as jsonFile:
-    data = jload(jsonFile)
-    cameraMat = data['cameraMat']
-    distortCoef = data['distortionCoef']
-cameraMat = array(cameraMat)
-distortCoef = array(distortCoef)
-
-class_names = [name.strip() for name in open(label_path).readlines()]
-num_classes = len(class_names)
-
-if opt.net == 'mb2-ssd':
-    net = create_mobilenetv2_ssd_lite(
-        num_classes=num_classes,
-        is_test=True,
-    )
-    predictor = create_mobilenetv2_ssd_lite_predictor(net, candidate_size=200)
-elif opt.net == 'mb2-ffssd':
-    net = create_mobilenetv2_ffssd(
-        num_classes=num_classes,
-        is_test=True,
-    )
-    predictor = create_mobilenetv2_ffssd_predictor(net, candidate_size=200)
-net.load_state_dict(load(model_path, map_location=lambda storage, loc: storage))
-timer = Timer()
-
-def control(key, speed):
-    if key == ord('z'): return (tello.takeoff(), speed)
-    elif key == ord('x'): return (tello.land(), speed)
-    elif key == ord('a'): return (tello.move_left(50), speed)
-    elif key == ord('d'): return (tello.move_right(50), speed)
-    elif key == ord('w'): return (tello.move_forward(50), speed)
-    elif key == ord('s'): return (tello.move_back(50), speed)
-    elif key == ord('j'): return (tello.rotate_counter_clockwise(20), speed)
-    elif key == ord('l'): return (tello.rotate_clockwise(20), speed)
-    elif key == ord('i'): return (tello.move_up(20), speed)
-    elif key == ord('k'): return (tello.move_down(20), speed)
-    elif key == ord('[') and speed > 10:
-        speed -= 10
-        return (tello.set_speed(speed), speed)
-    elif key == ord(']') and speed < 100:
-        speed += 10
-        return (tello.set_speed(speed), speed)
-    return (True, speed)
-
-def detect(image):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    timer.start()
-    boxes, labels, _ = predictor.predict(image, 10, 0.4)
-    interval = timer.end()
-    print('Time: {:.2f}s, Detect Objects: {:d}'.format(interval*1000, labels.size(0)))
-    if boxes.size(0) == 1:
-        box = boxes[0, :]
-        _box = (box[0], box[1], box[2]-box[0], box[3]-box[1])
-        return (True, _box)
-    else: return (False, False)
-
-def get_distance(wp, hp):
-    return (kw/wp, kh/hp)
-
-class Tracker():
-    def __init__(self, algo='ssd', frame = False, bbox = False):
-        self.tracker = None
-        if algo == 'algo':
-            assert type(frame) != bool, 'Frame Cannot be empty for Algo'
-            assert type(bbox) != bool, 'Bbox cannot be None for Algo'
-            self._tracker = cv2.TrackerMedianFlow_create()
-            self._tracker.init(frame, bbox)
-            self.tracker = self._tracker.update
-        elif algo == 'ssd':
-            self.tracker = detect
-
-        assert self.tracker != None, 'Wrong Algo'
-    def __call__(self, frame):
-        return self.tracker(frame)
-
-def maintain_x(out):
-    if out >= 0: tello.rotate_counter_clockwise(int(3.58*out+2.0))
-    elif out < 0: tello.rotate_clockwise(int(-3.58*out+2.0))
-
-def maintain_y(out):
-    if out >= 0: tello.move_up(int(4.8*out+20.0))
-    elif out < 0: tello.move_down(int(-4.8*out+20.0))
-
-def maintain_dist(out):
-    if out >= 0: tello.move_back(int(4.8*out+20.0))
-    elif out < 0: tello.move_forward(int(-4.8*out+20.0))
-
-def init_control(x_flag, y_flag, outx, outy):
-    if not x_flag: maintain_x(outx)
-    elif not y_flag: maintain_y(outy)
-
-def search_target():
-    fail = 0
-    rotate = 20
-    rotation = 0
-
-    up = 40
-    lifted = 0
-
-    forward = 20
-    RECORD = True
-    while True:
-        _frame = frame_read.frame
-        frame = cv2.undistort(_frame, cameraMat, distortCoef)
-        ok, bbox = detect(frame)
-        cv2.putText(frame, 'SEARCHING TARGET',
-                    (20, h-90),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,  # font scale
-                    (255, 0, 0),
-                    2)
-        if ok:
-            cv2.rectangle(frame,
-                (int(bbox[0]), int(bbox[1])),
-                (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])),
-                (255, 0, 0), 2)
-            r1 = bbox[3]/bbox[2]
-            r2 = bbox[2]/bbox[3]
-            print(r1, r2)
-            dr1 = abs(r1-1.673)
-            dr2 = abs(r2-0.597)
-            if r2 <= 0.5: break
-            else: fail += 1
-        else: fail += 1
-
-        if fail > 5:
-            if rotation >= 360:
-                if lifted >= 100:
-                    tello.move_down(lifted)
-                    ok = tello.move_forward(forward)
-                    while not ok:
-                        ok = tello.move_forward(forward)
-                    lifted = 0
-                else:
-                    tello.move_up(up)
-                    lifted += up
-                    rotation = 0
-            else:
-                tello.rotate_clockwise(rotate)
-                rotation += rotate
-            fail = 0
-        cv2.imshow('TELLO', frame)
-        writer.write(frame)
-        if cv2.waitKey(1) == 27: break
-    return (_frame, bbox)
-
-def program():
-    pid_x = PID(0.022, 0.0005, 0.001, setpoint=set_point_x, output_limits=(-100, 100), sample_time=None)
-    pid_y = PID(0.01, 0.0000, 0.0005, setpoint=set_point_y, output_limits=(-100, 100), sample_time=None)
-    pid_dist = PID(0.007, 0.0001, 0.004, setpoint=set_point_dist, output_limits=(-100, 100), sample_time=None)
-    mv_y = 0
-    mv_x = 0
-    mv_dist = 0
-    x_flag = False
-    y_flag = False
-    dist_flag = False
-    init_flag = False
-    RECORD = True
-    buff2 = 'No Accomplished'
-    wait = 1 if opt.tracking == 'ssd' else 200
-
-    _frame, bbox = search_target()
-
-    if opt.tracking == 'algo': tracker = Tracker(algo=opt.tracking, frame=_frame, bbox=bbox)
-    else: tracker = Tracker(algo=opt.tracking)
-    while True:
-        frame = cv2.undistort(frame_read.frame, cameraMat, distortCoef)
-        ok, bbox = tracker(frame)
-        if ok:
-            cv2.rectangle(frame,
-                (int(bbox[0]), int(bbox[1])),
-                (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3])),
-                (0, 255, 0), 2)
-
-            center_x = (bbox[2]/2)+bbox[0]
-            center_y = (bbox[3]/2)+bbox[1]
-            err_x = abs(center_x-set_point_x)
-            err_y = abs(center_y-set_point_y)
-
-            _, d2 = get_distance(bbox[2], bbox[3])
-            err_dist = abs(d2-set_point_dist)
-            if not init_flag:
-                if not x_flag:
-                    if (err_x < lambda_x):
-                        x_flag = True
-                        pid_x.reset()
-                        buff2 = 'X Centered'
-                    elif (err_x > lambda_x): mv_x = pid_x(center_x)
-                    buff = 'Controlling center X %.2f, Center X %.2f'%(mv_x, center_x)
-                elif not y_flag:
-                    if (err_y < lambda_y):
-                        y_flag = True
-                        pid_y.reset()
-                        buff2 = buff2 + '  Y Centered'
-                    elif (err_y > lambda_y): mv_y = pid_y(center_y)
-                    buff = 'Controlling center Y %.2f, Center Y%.2f'%(mv_y, center_y)
-                init_control(x_flag, y_flag, mv_x, mv_y)
-
-                if x_flag and y_flag: init_flag = True
-            else:
-                if not dist_flag:
-                    if (err_dist < lambda_d):
-                        dist_flag = True
-                        pid_dist.reset()
-                        buff2 = buff2 + '  Dist Approached'
-                        tello.land()
-                    elif (err_dist > lambda_d):
-                        mv_dist = pid_dist(d2)
-                        maintain_dist(mv_dist)
-                        if err_x > lambda_x or err_y > lambda_y:
-                            x_flag = False
-                            y_flag = False
-                            init_flag = False
-                            pid_dist.reset()
-                    buff = 'Controlling Distance %.2f, Dist %.2f'%(mv_dist, d2)
-            cv2.putText(frame, buff,
-                (20, 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,  # font scale
-                (127, 127, 255),
-                2)
-
-        cv2.putText(frame, buff2,
-                (20, int(h/2)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,  # font scale
-                (255, 255, 0),
-                2)
-        cv2.putText(frame, 'TRACKING',
-                (20, int(h-90)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,  # font scale
-                (255, 0, 0),
-                2)
-        cv2.imshow('TELLO', frame)
-        writer.write(frame)
-        key = cv2.waitKey(wait)
-        if key == 27: break
-        elif key == ord('e') and RECORD:
-            writer.release()
-            RECORD = False
+    return predictor
 
 def main():
-    count = 0
-    _speed = 10
-    while True:
-        image = frame_read.frame
-        cv2.imshow('TELLO', image)
-        key = cv2.waitKey(30)
-        count += 1
-        if count == 17:
-            flag, speed = control(key, _speed)
-            if flag: _speed = speed
-            b = tello.get_battery()
-            print(b)
-            count = 0
+    """ Create a tello controller and show the video feed."""
+    tellotrack = TelloCV(_predictor=init_predictor(), use_w=(lambda: 0, lambda: 1)[configs['MEASURING']['use'] == 'w']())
 
-        if key == 27:
-            if RECORD:
-                writer.release()
-            break
-        elif key == ord('p'): program()
-        elif key == ord('e') and RECORD:
-            writer.release()
+    for packet in tellotrack.container.demux((tellotrack.vid_stream,)):
+        for frame in packet.decode():
+            image = tellotrack.process_frame(frame)
+            cv2.imshow('tello', image)
+            _ = cv2.waitKey(1) & 0xFF
+
+class TelloCV(object):
+    """
+    TelloTracker builds keyboard controls on top of TelloPy as well
+    as generating images from the video stream and enabling opencv support
+    """
+
+    def __init__(self, _predictor: Predictor, use_w: int):
+        # Define all flags
+        self.flags = Flags()
+        self.use_w = use_w
+
+        # Init drone
+        self.prev_flight_data = None
+        self.date_fmt = '%Y-%m-%d_%H%M%S'
+        self.speed = 50
+        self.drone = tellopy.Tello()
+        self.init_drone()
+        self.init_controls()
+        self.pid_configs = configs['PID']
+
+        # container for processing the packets into frames
+        self.container = av.open(self.drone.get_video_stream())
+        self.vid_stream = self.container.streams.video[0]
+        self.out_file = None
+        self.out_stream = None
+        self.out_name = None
+        self.start_time = time.time()
+
+        self.track_cmd = ""
+        self.tracker = Tracker(kw=configs['MEASURING']['w'], kh=configs['MEASURING']['h'], predictor=_predictor)
+
+    def init_drone(self):
+        """Connect, uneable streaming and subscribe to events"""
+        # self.drone.log.set_level(2)
+        self.drone.connect()
+        self.drone.start_video()
+        self.drone.subscribe(self.drone.EVENT_FLIGHT_DATA,
+                             self.flight_data_handler)
+        self.drone.subscribe(self.drone.EVENT_FILE_RECEIVED,
+                             self.handle_flight_received)
+
+
+    def on_press(self, keyname):
+        """handler for keyboard listener"""
+        if self.flags.keydown:
+            return
+        try:
+            self.flags.keydown = True
+            keyname = str(keyname).strip('\'')
+            print('+' + keyname)
+            if keyname == 'Key.esc':
+                self.drone.quit()
+                exit(0)
+            elif keyname == 'm':
+                return self.toggle_mission(self.speed)
+
+            # Return if on mission, mean disable all key pressed execept above keys
+            if self.flags.mission:
+                return
+
+            if keyname in self.controls:
+                key_handler = self.controls[keyname]
+                if isinstance(key_handler, str):
+                    getattr(self.drone, key_handler)(self.speed)
+                else:
+                    key_handler(self.speed)
+        except AttributeError:
+            print('special key {0} pressed'.format(keyname))
+
+    def on_release(self, keyname):
+        """Reset on key up from keyboard listener"""
+        self.flags.keydown = False
+        keyname = str(keyname).strip('\'')
+        print('-' + keyname)
+        if keyname in self.controls:
+            key_handler = self.controls[keyname]
+            if isinstance(key_handler, str):
+                getattr(self.drone, key_handler)(0)
+            else:
+                key_handler(0)
+
+    def init_controls(self):
+        """Define keys and add listener"""
+        self.controls = {
+            'w': 'forward',
+            's': 'backward',
+            'a': 'left',
+            'd': 'right',
+            'Key.space': 'up',
+            'Key.shift': 'down',
+            'Key.shift_r': 'down',
+            'q': 'counter_clockwise',
+            'e': 'clockwise',
+            'i': lambda speed: self.drone.flip_forward(),
+            'k': lambda speed: self.drone.flip_back(),
+            'j': lambda speed: self.drone.flip_left(),
+            'l': lambda speed: self.drone.flip_right(),
+            # arrow keys for fast turns and altitude adjustments
+            'Key.left': lambda speed: self.drone.counter_clockwise(speed),
+            'Key.right': lambda speed: self.drone.clockwise(speed),
+            'Key.up': lambda speed: self.drone.up(speed),
+            'Key.down': lambda speed: self.drone.down(speed),
+            'Key.tab': lambda speed: self.drone.takeoff(),
+            'Key.backspace': lambda speed: self.drone.land(),
+            'p': lambda key_up: self.palm_land(key_up),
+            't': lambda key_up: self.toggle_tracking(key_up),
+            'r': lambda key_up: self.toggle_recording(key_up),
+            'z': lambda key_up: self.toggle_zoom(key_up),
+            'm': lambda key_up: self.toggle_mission(key_up),
+            'Key.enter': lambda key_up: self.take_picture(key_up)
+        }
+        self.key_listener = keyboard.Listener(on_press=self.on_press,
+                                              on_release=self.on_release)
+        self.key_listener.start()
+
+        self.pid_x = PID(*self.pid_configs['constants']['x'], output_limits=(-100, 100), sample_time=None)
+        self.pid_y = PID(*self.pid_configs['constants']['y'], output_limits=(-100, 100), sample_time=None)
+        self.pid_d = PID(*self.pid_configs['constants']['d'], setpoint=self.pid_configs['distance'], output_limits=(-100, 100), sample_time=None)
+
+    def init_mission_controls(self, h, w):
+        self.pid_x.setpoint = w/2
+        self.pid_y.setpoint = h/2
+        self.flags.mission_controls_init = True
+        return
+
+    def process_frame(self, frame):
+        """convert frame to cv2 image and show"""
+        image = cv2.cvtColor(numpy.array(
+            frame.to_image()), cv2.COLOR_RGB2BGR)
+
+        if not self.flags.mission_controls_init:
+            self.init_mission_controls(*image.shape)
+
+        if self.flags.record:
+            self.record_vid(frame)
+
+        if self.flags.tracking:
+            try:
+                dists, image = self.tracker(image)
+                if self.flags.mission:
+                    # Dists is (Distance by h, Distance by w)
+                    self.mission_control()
+            except ValueError as e:
+                print(e)
+
+        image = self.write_hud(image)
+
+        return image
+
+    def write_hud(self, frame):
+        """Draw drone info, tracking and record on frame"""
+        stats = self.prev_flight_data.split('|')
+        stats.append("Tracking:" + str(self.flags.tracking))
+        if self.drone.zoom:
+            stats.append("VID")
+        else:
+            stats.append("PIC")
+        if self.flags.record:
+            diff = int(time.time() - self.start_time)
+            mins, secs = divmod(diff, 60)
+            stats.append("REC {:02d}:{:02d}".format(mins, secs))
+
+        if self.flags.mission:
+            stats.append("ON MISSION")
+
+        for idx, stat in enumerate(stats):
+            text = stat.lstrip()
+            cv2.putText(frame, text, (0, 30 + (idx * 30)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (255, 0, 0), lineType=30)
+        return frame
+
+    def toggle_recording(self, key_up):
+        """Handle recording keypress, creates output stream and file"""
+        if key_up == 0:
+            return
+        self.flags.record = not self.flags.record
+
+        if self.flags.record:
+            datename = [os.getenv('HOME'), datetime.datetime.now().strftime(self.date_fmt)]
+            self.out_name = '{}/Pictures/tello-{}.mp4'.format(*datename)
+            print("Outputting video to:", self.out_name)
+            self.out_file = av.open(self.out_name, 'w')
+            self.start_time = time.time()
+            self.out_stream = self.out_file.add_stream(
+                'mpeg4', self.vid_stream.rate)
+            self.out_stream.pix_fmt = 'yuv420p'
+            self.out_stream.width = self.vid_stream.width
+            self.out_stream.height = self.vid_stream.height
+
+        if not self.flags.record:
+            print("Video saved to ", self.out_name)
+            self.out_file.close()
+            self.out_stream = None
+
+    def record_vid(self, frame):
+        """
+        convert frames to packets and write to file
+        """
+        new_frame = av.VideoFrame(
+            width=frame.width, height=frame.height, format=frame.format.name)
+        for i in range(len(frame.planes)):
+            new_frame.planes[i].update(frame.planes[i])
+        pkt = None
+        try:
+            pkt = self.out_stream.encode(new_frame)
+        except IOError as err:
+            print("encoding failed: {0}".format(err))
+        if pkt is not None:
+            try:
+                self.out_file.mux(pkt)
+            except IOError:
+                print('mux failed: ' + str(pkt))
+
+    def take_picture(self, key_up):
+        """Tell drone to take picture, image sent to file handler"""
+        if key_up == 0:
+            return
+        self.drone.take_picture()
+
+    def palm_land(self, key_up):
+        """Tell drone to land"""
+        if key_up == 0:
+            return
+        self.drone.palm_land()
+
+    def toggle_tracking(self, key_up):
+        """ Handle tracking keypress"""
+        if key_up == 0:  # handle key up event
+            return
+        self.flags.tracking = not self.flags.tracking
+        print("tracking:", str(self.flags.tracking))
+        return
+
+    def toggle_zoom(self, key_up):
+        """
+        In "video" mode the self.drone sends 1280x720 frames.
+        In "photo" mode it sends 2592x1936 (952x720) frames.
+        The video will always be centered in the window.
+        In photo mode, if we keep the window at 1280x720 that gives us ~160px on
+        each side for status information, which is ample.
+        Video mode is harder because then we need to abandon the 16:9 display size
+        if we want to put the HUD next to the video.
+        """
+        if key_up == 0:
+            return
+        # Re-init the mission controls
+        self.flags.mission_controls_init = False
+        self.flags.mission = False
+
+        self.drone.set_video_mode(not self.drone.zoom)
+
+    def toggle_mission(self, key_up):
+        if key_up == 0:
+            return
+        self.flags.mission = not self.flags.mission
+        # Always reset PID if mission flag's toggled
+        self.pid_x.reset()
+        self.pid_y.reset()
+        self.pid_d.reset()
+        print("mission:", self.flags.mission)
+        return
+
+    def flight_data_handler(self, event, sender, data):
+        """Listener to flight data from the drone."""
+        text = str(data)
+        if self.prev_flight_data != text:
+            self.prev_flight_data = text
+
+    def handle_flight_received(self, event, sender, data):
+        """Create a file in ~/Pictures/ to receive image from the drone"""
+        path = '%s/Pictures/tello-%s.jpeg' % (
+            os.getenv('HOME'),
+            datetime.datetime.now().strftime(self.date_fmt))
+        with open(path, 'wb') as out_file:
+            out_file.write(data)
+        print('Saved photo to %s' % path)
+
+    def mission_control(self):
+        distance = self.tracker.dists[self.use_w]
+        box = self.tracker.target_box
+        center_x = box[0]+box[2]/2
+        center_y = box[1]+box[3]/2
+        mv_x = self.pid_x(center_x)
+        mv_y = self.pid_y(center_y)
+        mv_d = self.pid_d(distance)
+        return True
 
 if __name__ == '__main__':
     main()
-    tello.land()
-    sleep(1)
-    tello.end()
-    writer.release()

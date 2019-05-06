@@ -2,6 +2,7 @@
 __pycache__/
 models/*.pth
 models/*.pt
+test*
 *.pth
 *.avi
 *.pt

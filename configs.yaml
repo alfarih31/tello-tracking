@@ -1,0 +1,34 @@
+# Configs for camera calibration
+CALIB_PATH: 'calibrateData.json'
+# Configs for Detectors
+MODELS:
+  name: 'mb2-ffssd'
+  weight: 'models/'
+  label: 'models/'
+
+# Configs for measuring distance
+MEASURING:
+  w: 2375 # w gradient
+  h: 38950 # h gradient
+  use: 'w'
+
+# Configs for mission control
+PID:
+  lambda: # Order: X, Y, D
+    - 0.125 # Tolerance error by 12.5%
+    - 0.125 # Tolerance error by 12.5%
+    - 0.15 # Tolerance error by 15%
+  distance: 55 # Target in cm
+  constants: # Order: Kp, Ki, Kd
+    x:
+      - 0.022
+      - 0.0005
+      - 0.001
+    y:
+      - 0.01
+      - 0.0
+      - 0.0005
+    d:
+      - 0.007
+      - 0.0001
+      - 0.004
