@@ -23,11 +23,13 @@ Controls:
 import time
 import datetime
 import os
+from json import load as json_load
+
 import tellopy
-import numpy
 import av
 import cv2
 from yaml import load as yaml_load
+from numpy import array as np_array
 from torch import load, set_flush_denormal
 from simple_pid import PID
 
@@ -40,6 +42,12 @@ from tracker import Tracker
 
 set_flush_denormal(True)
 configs = yaml_load(open('configs.yaml', 'r'))
+with open(configs['CALIB_PATH'], 'r') as json:
+    json_datas = json_load(json)
+    camera_mat = json_datas['cameraMat']
+    distort_coef = json_datas['distortionCoef']
+camera_mat = np_array(camera_mat)
+distort_coef = np_array(distort_coef)
 
 def init_predictor():
     class_names = [name.strip() for name in open(configs['MODELS']['LABEL']).readlines()]
@@ -82,7 +90,7 @@ class TelloCV(object):
     def __init__(self, _predictor: Predictor, use_w: int):
         # Define all flags
         self.flags = Flags()
-        self.use_w = use_w
+        self.use_w = use_w # 1 if 'use' in configs is 'w'. else 0
 
         # Init drone
         self.prev_flight_data = None
@@ -92,6 +100,11 @@ class TelloCV(object):
         self.init_drone()
         self.init_controls()
         self.pid_configs = configs['PID']
+        self.mission_controls = None
+        self.variables = ['x', 'y', 'd']
+        self.process_mv = dict
+        self.process_pv = dict
+        self.tolerances = dict
 
         # container for processing the packets into frames
         self.container = av.open(self.drone.get_video_stream())
@@ -101,8 +114,8 @@ class TelloCV(object):
         self.out_name = None
         self.start_time = time.time()
 
-        self.track_cmd = ""
-        self.tracker = Tracker(kw=configs['MEASURING']['w'], kh=configs['MEASURING']['h'], predictor=_predictor)
+        self.tracker = Tracker(kw=configs['MEASURING']['w'], kh=configs['MEASURING']['h'],
+                               predictor=_predictor, flags=self.flags)
 
     def init_drone(self):
         """Connect, uneable streaming and subscribe to events"""
@@ -130,7 +143,7 @@ class TelloCV(object):
                 return self.toggle_mission(self.speed)
 
             # Return if on mission, mean disable all key pressed execept above keys
-            if self.flags.mission:
+            if self.flags.on_mission:
                 return
 
             if keyname in self.controls:
@@ -178,7 +191,6 @@ class TelloCV(object):
             'Key.tab': lambda speed: self.drone.takeoff(),
             'Key.backspace': lambda speed: self.drone.land(),
             'p': lambda key_up: self.palm_land(key_up),
-            't': lambda key_up: self.toggle_tracking(key_up),
             'r': lambda key_up: self.toggle_recording(key_up),
             'z': lambda key_up: self.toggle_zoom(key_up),
             'm': lambda key_up: self.toggle_mission(key_up),
@@ -190,18 +202,35 @@ class TelloCV(object):
 
         self.pid_x = PID(*self.pid_configs['constants']['x'], output_limits=(-100, 100), sample_time=None)
         self.pid_y = PID(*self.pid_configs['constants']['y'], output_limits=(-100, 100), sample_time=None)
-        self.pid_d = PID(*self.pid_configs['constants']['d'], setpoint=self.pid_configs['distance'], output_limits=(-100, 100), sample_time=None)
+        self.pid_d = PID(*self.pid_configs['constants']['d'], setpoint=self.pid_configs['distance'],
+                         output_limits=(-100, 100), sample_time=None)
 
     def init_mission_controls(self, h, w):
+        self.process_mv = {
+            'x': lambda mv: self.drone.counter_clockwise(mv) if mv >= 0 else self.drone.clockwise(mv),
+            'y': lambda mv: self.drone.up(mv) if mv >= 0 else self.drone.down(mv),
+            'd': lambda mv: self.drone.forward(mv) if mv >= 0 else self.drone.backward(mv),
+        }
         self.pid_x.setpoint = w/2
         self.pid_y.setpoint = h/2
+        self.process_pv = {
+            'x': self.pid_x,
+            'y': self.pid_y,
+            'd': self.pid_d,
+        }
+        self.tolerances = {
+            'x': self.pid_configs['lambda'][0]*self.pid_x.setpoint,
+            'y': self.pid_configs['lambda'][1]*self.pid_y.setpoint,
+            'd': self.pid_configs['lambda'][2]*self.pid_d.setpoint,
+        }
         self.flags.mission_controls_init = True
         return
 
     def process_frame(self, frame):
-        """convert frame to cv2 image and show"""
-        image = cv2.cvtColor(numpy.array(
+        """convert frame to cv2 image"""
+        image = cv2.cvtColor(np_array(
             frame.to_image()), cv2.COLOR_RGB2BGR)
+        image = cv2.undistort(image, camera_mat, distort_coef)
 
         if not self.flags.mission_controls_init:
             self.init_mission_controls(*image.shape)
@@ -209,14 +238,18 @@ class TelloCV(object):
         if self.flags.record:
             self.record_vid(frame)
 
-        if self.flags.tracking:
+        if self.flags.on_mission:
             try:
-                dists, image = self.tracker(image)
-                if self.flags.mission:
-                    # Dists is (Distance by h, Distance by w)
-                    self.mission_control()
+                image = self.tracker(image)
+                if not self.flags.on_tracking:
+                    self.flags.on_tracking = not self.flags.on_tracking
+                    self.reset_all_pids()
+                self.mission_control()
             except ValueError as e:
                 print(e)
+                if not self.flags.on_tracking:
+                    self.flags.fails_counter += 1
+                    self.move_drone()
 
         image = self.write_hud(image)
 
@@ -225,7 +258,6 @@ class TelloCV(object):
     def write_hud(self, frame):
         """Draw drone info, tracking and record on frame"""
         stats = self.prev_flight_data.split('|')
-        stats.append("Tracking:" + str(self.flags.tracking))
         if self.drone.zoom:
             stats.append("VID")
         else:
@@ -235,7 +267,7 @@ class TelloCV(object):
             mins, secs = divmod(diff, 60)
             stats.append("REC {:02d}:{:02d}".format(mins, secs))
 
-        if self.flags.mission:
+        if self.flags.on_mission:
             stats.append("ON MISSION")
 
         for idx, stat in enumerate(stats):
@@ -299,14 +331,6 @@ class TelloCV(object):
             return
         self.drone.palm_land()
 
-    def toggle_tracking(self, key_up):
-        """ Handle tracking keypress"""
-        if key_up == 0:  # handle key up event
-            return
-        self.flags.tracking = not self.flags.tracking
-        print("tracking:", str(self.flags.tracking))
-        return
-
     def toggle_zoom(self, key_up):
         """
         In "video" mode the self.drone sends 1280x720 frames.
@@ -321,19 +345,16 @@ class TelloCV(object):
             return
         # Re-init the mission controls
         self.flags.mission_controls_init = False
-        self.flags.mission = False
 
         self.drone.set_video_mode(not self.drone.zoom)
 
     def toggle_mission(self, key_up):
         if key_up == 0:
             return
-        self.flags.mission = not self.flags.mission
+        self.flags.on_mission = not self.flags.on_mission
         # Always reset PID if mission flag's toggled
-        self.pid_x.reset()
-        self.pid_y.reset()
-        self.pid_d.reset()
-        print("mission:", self.flags.mission)
+        self.reset_all_pids()
+        print("on_mission:", self.flags.on_mission)
         return
 
     def flight_data_handler(self, event, sender, data):
@@ -354,12 +375,44 @@ class TelloCV(object):
     def mission_control(self):
         distance = self.tracker.dists[self.use_w]
         box = self.tracker.target_box
-        center_x = box[0]+box[2]/2
-        center_y = box[1]+box[3]/2
-        mv_x = self.pid_x(center_x)
-        mv_y = self.pid_y(center_y)
-        mv_d = self.pid_d(distance)
-        return True
+        for i, var in enumerate(self.variables):
+            if i < 2:
+                center = box[i]+box[i+2]/2
+                self.process_mv[var](
+                    self.process_pv[var](
+                        center if abs(center-self.process_pv[var].setpoint) > self.tolerances[var] \
+                               else self.process_pv[var].setpoint
+                    )
+                )
+            else:
+                delta_distance = abs(distance-self.process_pv[var].setpoint)
+                self.process_mv[var](
+                    self.process_pv[var](
+                        distance if  delta_distance > self.tolerances[var] \
+                               else self.process_pv[var].setpoint
+                    )
+                )
+                if delta_distance < self.tolerances[var]:
+                    self.flags.on_tracking = not self.flags.on_tracking
+
+        return
+
+    def reset_all_pids(self):
+        for var in self.variables:
+            self.process_pv[var].reset()
+        return
+
+    def move_drone(self):
+        if self.flags.fails_counter < 4:
+            self.drone.up(self.speed)
+        elif self.flags.fails_counter >= 4 and self.flags.fails_counter < 9:
+            self.drone.clockwise(self.speed)
+        elif self.flags.fails_counter >= 9 and self.flags.fails_counter < 14:
+            self.drone.down(self.speed)
+        else:
+            self.flags.fails_counter = 0
+        return
+
 
 if __name__ == '__main__':
     main()

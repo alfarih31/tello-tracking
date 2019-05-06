@@ -31,9 +31,9 @@ class Matcher:
         return (max_loc[0]+w/6, max_loc[1]+h/6, max_loc[0]+w, max_loc[1]+h)
 
 class Tracker:
-    def __init__(self, kw: float, kh: float, predictor):
+    def __init__(self, kw: float, kh: float, predictor, flags: Flags):
         self.predictor = predictor
-        self.flags = Flags()
+        self.flags = flags
         self.kw = kw
         self.kh = kh
         self.matcher = None
@@ -41,9 +41,7 @@ class Tracker:
         self.dists = None
 
     def __call__(self, img):
-        """
-        Return: (Distance by h, Distance by w, image)
-        """
+        """Return: (Distance by h, Distance by w, image)"""
         boxes = self.detect(img)
 
         if not self.flags.tracker_init:
@@ -52,9 +50,7 @@ class Tracker:
         return self.track(img, boxes)
 
     def init_tracker(self, img, boxes):
-        """
-        Used to initializing the Matcher object with the most nearest object
-        """
+        """Used to initializing the Matcher object with the most nearest object"""
         # Get box with the most largetst area, i.e. the most nearest object
         minArea = 0
         for i in range(boxes.size(0)):
@@ -94,9 +90,7 @@ class Tracker:
         return img
 
     def detect(self, image):
-        """
-        Inference the detector to detect all human object in images
-        """
+        """Inference the detector to detect all human object in images"""
         img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         timer.start()
         boxes, labels, _ = self.predictor.predict(img, 10, 0.4)
